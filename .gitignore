@@ -39,3 +39,9 @@ MT32_CONTROL.ROM
 MT32_PCM.ROM
 src/fluid_soundfont.inc
 src/gm_soundfont.inc
+
+# Backup local da pasta src. Sao 105 MB e o GitHub recusa arquivo acima de 100 MB
+# (erro GH001 no push), entao ele nao entra no repositorio. O arquivo continua no
+# disco; e' so o versionamento que para de enxerga-lo.
+src/src.zip
+src/*.zip
