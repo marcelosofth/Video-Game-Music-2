@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdio.h>
+#include <math.h>
+#include <time.h>
 
 #include <libretro.h>
 #include <retro_miscellaneous.h>
@@ -15,6 +17,21 @@
 #include "credits_logo.h"
 #include "credits_sonic.h"
 #include "credits_sprites.h"
+#include "xevious_ship.h"
+#include "galaga_ship.h"
+#include "raiden_ship.h"
+#include "viper_ship.h"
+#include "pulstar_ship.h"
+#include "rtype_ship.h"
+#include "choplifter_ship.h"
+#include "rallyx_cars.h"
+#include "arthur_run.h"
+#include "mario_run.h"
+#include "sonic_run.h"
+#include "car_run.h"
+#include "runners_extra.h"
+#include "shinobi_run.h"
+#include "alex_run.h"
 
 // Static globals
 static surface *framebuffer = NULL;
@@ -473,6 +490,52 @@ static void draw_transport_bar(void)
 #define LOGO_LED_Y 64
 #define LOGO_LED_R 4
 
+/* texto 2x com DIGITOS DE LARGURA FIXA (celula = digito mais largo), para o
+ * tempo nao "tremer" quando muda de numero */
+static int tab_digit_cell(void)
+{
+   static int cell = 0;
+   if (!cell)
+   {
+      int d, x0, x1;
+      for (d = '0'; d <= '9'; d++)
+      {
+         glyph_extent((unsigned char)d, &x0, &x1);
+         if (x1 >= 0 && (x1 - x0 + 2) * 2 > cell)
+            cell = (x1 - x0 + 2) * 2;
+      }
+      if (!cell)
+         cell = 12;
+   }
+   return cell;
+}
+
+static void draw_text_tab(const char *text, int x, int y, unsigned short color)
+{
+   int x0, x1;
+   for (; *text; text++)
+   {
+      unsigned char ch = (unsigned char)*text;
+      glyph_extent(ch, &x0, &x1);
+      if (x1 < 0)
+      {
+         x += 4 * 2;
+         continue;
+      }
+      if (ch >= '0' && ch <= '9')
+      {
+         int cell = tab_digit_cell();
+         put_glyph(ch, x + (cell - (x1 - x0 + 2) * 2) / 2 - x0 * 2, y, color, 0, 640);
+         x += cell;
+      }
+      else
+      {
+         put_glyph(ch, x - x0 * 2, y, color, 0, 640);
+         x += (x1 - x0 + 2) * 2;
+      }
+   }
+}
+
 static void draw_ui(void)
 {
    char message[512];
@@ -509,7 +572,21 @@ static void draw_ui(void)
       draw_shape(framebuffer, get_color(12, 25, 28), UI_LEFT, 413, (UI_W * prog) / 1000, 12);
 
    /* tempo (esquerda) e taxa de amostragem (direita) */
-   draw_text_prop(get_time_text(message), UI_LEFT, 442, get_color(27, 54, 29));
+   {
+      int em = 0, es = 0, tmn = 0, tsc = 0, ecs = 0;
+      int fr = get_track_elapsed_frames();
+      char tbuf[64];
+      get_time_text(message);
+      if (sscanf(message, "%d:%d/%d:%d", &em, &es, &tmn, &tsc) == 4)
+      {
+         if (fr / 60 == em * 60 + es)
+            ecs = (fr % 60) * 100 / 60;
+         snprintf(tbuf, sizeof(tbuf), "%d:%02d:%02d/%d:%02d", em, es, ecs, tmn, tsc);
+         draw_text_tab(tbuf, UI_LEFT, 442, get_color(27, 54, 29));
+      }
+      else
+         draw_text_prop(message, UI_LEFT, 442, get_color(27, 54, 29));
+   }
 
    get_rate_text(message);
    w = text_width_prop(message);
@@ -523,8 +600,65 @@ static void draw_ui(void)
 #define WAVE_H    48
 #define WAVE_GAP  10
 
+/* Degrade de transparencia do osciloscopio roxo (canal de baixo) em volta dos 2 VU meters:
+ * no centro de cada VU a linha fica quase transparente (WAVE_FADE_MIN) e volta a ficar opaca
+ * a WAVE_FADE_R pixels de distancia, com transicao suave. */
+#define WAVE_FADE_L_CX  90     /* centro do VU esquerdo (mesmo valor de VU_L_CX) */
+#define WAVE_FADE_R_CX  550    /* centro do VU direito  (mesmo valor de VU_R_CX) */
+#define WAVE_FADE_HALF_BOX 30  /* raio em volta do centro do VU que fica bem apagado */
+#define WAVE_FADE_R     40     /* largura da transicao suave ate quase a borda da caixa do VU, em px */
+#define WAVE_FADE_MIN   40     /* opacidade minima no centro do VU (0 = some, 255 = opaca) */
+
+static int wave_fade_alpha(int x)
+{
+   int dl = abs(x - WAVE_FADE_L_CX), dr = abs(x - WAVE_FADE_R_CX);
+   int d = dl < dr ? dl : dr, t, sm;
+   if (d <= WAVE_FADE_HALF_BOX)
+      return WAVE_FADE_MIN;                              /* dentro da caixa do VU: totalmente apagado */
+   d -= WAVE_FADE_HALF_BOX;
+   if (d >= WAVE_FADE_R)
+      return 255;
+   t  = d * 256 / WAVE_FADE_R;                        /* 0..255 */
+   sm = ((t * t) >> 8) * (768 - 2 * t) >> 8;          /* smoothstep 0..256 */
+   return WAVE_FADE_MIN + ((255 - WAVE_FADE_MIN) * sm) / 256;
+}
+
+static void wave_plot_fade(int x, int y, unsigned short color)
+{
+   uint16_t *fb = (uint16_t *)framebuffer->pixel_data;
+   uint16_t *dst;
+   int a, ir, ig, ib, br, bg, bb;
+   unsigned short bgc;
+   if (x < 0 || x >= 640 || y < 0 || y >= 480)
+      return;
+   a   = wave_fade_alpha(x);
+   dst = &fb[x + y * framebuffer->width];
+   bgc = *dst;
+   ir = (color >> 11) & 31; ig = (color >> 5) & 63; ib = color & 31;
+   br = (bgc   >> 11) & 31; bg = (bgc   >> 5) & 63; bb = bgc  & 31;
+   *dst = get_color((ir * a + br * (255 - a)) / 255,
+                    (ig * a + bg * (255 - a)) / 255,
+                    (ib * a + bb * (255 - a)) / 255);
+}
+
+static void wave_line_fade(int x0, int y0, int x1, int y1, unsigned short color)
+{
+   int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+   int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+   int err = dx + dy, e2;
+   for (;;)
+   {
+      wave_plot_fade(x0, y0, color);
+      if (x0 == x1 && y0 == y1)
+         break;
+      e2 = 2 * err;
+      if (e2 >= dy) { err += dy; x0 += sx; }
+      if (e2 <= dx) { err += dx; y0 += sy; }
+   }
+}
+
 static void draw_wave_channel(const short *audio, int frames, int offset,
-                               int y0, int h, unsigned short color, int gain_q8)
+                               int y0, int h, unsigned short color, int gain_q8, int fade)
 {
    int x, px = -1, py = 0;
    int mid = y0 + h / 2;
@@ -540,7 +674,12 @@ static void draw_wave_channel(const short *audio, int frames, int offset,
       if (y < y0)         y = y0;
       if (y >= y0 + h)     y = y0 + h - 1;
       if (px >= 0)
-         draw_line(framebuffer, color, UI_LEFT + px, py, UI_LEFT + x, y);
+      {
+         if (fade)
+            wave_line_fade(UI_LEFT + px, py, UI_LEFT + x, y, color);
+         else
+            draw_line(framebuffer, color, UI_LEFT + px, py, UI_LEFT + x, y);
+      }
       px = x;
       py = y;
    }
@@ -603,10 +742,204 @@ static void draw_waveform(const short *audio, int frames)
       if (gain[ch] < 256) gain[ch] = 256;
    }
 
-   draw_wave_channel(wave_lin, WAVE_SPAN, 0, WAVE_TOP, WAVE_H, get_color(10, 28, 31), gain[0]);
-   draw_wave_channel(wave_lin, WAVE_SPAN, 1, WAVE_TOP + WAVE_H + WAVE_GAP, WAVE_H, get_color(28, 12, 27), gain[1]);
+   draw_wave_channel(wave_lin, WAVE_SPAN, 0, WAVE_TOP, WAVE_H, get_color(10, 28, 31), gain[0], 0);
+   draw_wave_channel(wave_lin, WAVE_SPAN, 1, WAVE_TOP + WAVE_H + WAVE_GAP, WAVE_H, get_color(28, 12, 27), gain[1], 1);
 }
 
+
+/* ---- VU meters estereo (2 ponteiros analogicos: L e R) ----
+ * Posicao: um em cada lado, entre o osciloscopio e o espectro.
+ * Ajuste fino: VU_L_CX / VU_R_CX / VU_CY (centro de cada medidor, em pixels).
+ * VU_REF_DB: nivel (dBFS) que corresponde a "0" do VU; menor = ponteiro sobe mais. */
+#define VU_L_CX    90
+#define VU_R_CX    550
+#define VU_CY      252
+#define VU_BOX_W   124
+#define VU_BOX_H   90
+#define VU_R       58
+#define VU_ANG     55.0f
+#define VU_REF_DB  14.0f
+#define VU_HIT_TOL 0.04f   /* tolerancia (na escala 0..1) para o numero ficar preto */
+#define VU_PI      3.14159265f
+
+static const unsigned char vu_font[][6] = {
+   {'0',7,5,5,5,7}, {'1',2,6,2,2,7}, {'2',7,1,7,4,7}, {'3',7,1,7,1,7},
+   {'5',7,4,7,1,7}, {'7',7,1,2,2,2}, {'V',5,5,5,5,2}, {'U',5,5,5,5,7},
+   {'L',4,4,4,4,7}, {'R',6,5,6,5,5}
+};
+
+/* escala do VU (dB do VU -> posicao 0..1 no arco; comprimida a esquerda, como o real) */
+static const float vu_db_tab[9] = { -20.f, -10.f, -7.f, -5.f, -3.f, 0.f, 1.f, 2.f, 3.f };
+static const float vu_t_tab[9]  = { 0.00f, 0.25f, 0.38f, 0.50f, 0.62f, 0.78f, 0.85f, 0.92f, 1.00f };
+static const char *const vu_lbl[9] = { "20", "10", "7", "5", "3", "0", "1", "2", "3" };
+
+static float vu_pos[2] = { 0.0f, 0.0f };
+
+static void vu_px(int x, int y, unsigned short color)
+{
+   if (x < 0 || x >= 640 || y < 0 || y >= 480)
+      return;
+   set_pixel(framebuffer, x, y, color);
+}
+
+static void vu_text(const char *s, int cx, int y, unsigned short color)
+{
+   int len = (int)strlen(s);
+   int x   = cx - (len * 4 - 1) / 2;
+   int i, k, r, c;
+   for (i = 0; i < len; i++, x += 4)
+   {
+      for (k = 0; k < (int)(sizeof(vu_font) / sizeof(vu_font[0])); k++)
+      {
+         if (vu_font[k][0] != (unsigned char)s[i])
+            continue;
+         for (r = 0; r < 5; r++)
+            for (c = 0; c < 3; c++)
+               if ((vu_font[k][r + 1] >> (2 - c)) & 1)
+                  vu_px(x + c, y + r, color);
+         break;
+      }
+   }
+}
+
+static float vu_db_to_pos(float db)
+{
+   int i;
+   if (db <= vu_db_tab[0]) return 0.0f;
+   if (db >= vu_db_tab[8]) return 1.0f;
+   for (i = 0; i < 8; i++)
+      if (db < vu_db_tab[i + 1])
+         return vu_t_tab[i] + (vu_t_tab[i + 1] - vu_t_tab[i]) *
+                (db - vu_db_tab[i]) / (vu_db_tab[i + 1] - vu_db_tab[i]);
+   return 1.0f;
+}
+
+static void draw_vu_one(int cx, int ch, float pos)
+{
+   unsigned short c_arc    = get_color(29, 58, 29);
+   unsigned short c_inner  = get_color(9, 20, 16);
+   unsigned short c_red    = get_color(31, 16, 5);
+   unsigned short c_cyan   = get_color(6, 46, 31);
+   unsigned short c_green  = get_color(8, 50, 12);
+   unsigned short c_needle = get_color(10, 48, 31);
+   int x0 = cx - VU_BOX_W / 2;
+   int y0 = VU_CY - VU_BOX_H / 2;
+   int px = cx;
+   int py = y0 + VU_BOX_H - 12;
+   int i, rr;
+   float a, rad, s, c, bestd = 1.0f;
+   int hit = -1;
+
+   /* arco principal (vermelho a partir do 0) e arco interno discreto */
+   for (a = -VU_ANG; a <= VU_ANG; a += 0.5f)
+   {
+      float t = (a + VU_ANG) / (2.0f * VU_ANG);
+      rad = a * VU_PI / 180.0f;
+      s = sinf(rad);
+      c = cosf(rad);
+      for (rr = VU_R - 1; rr <= VU_R; rr++)
+         vu_px(px + (int)(s * rr + (s < 0 ? -0.5f : 0.5f)),
+               py - (int)(c * rr + 0.5f), t >= 0.78f ? c_red : c_arc);
+      if (t < 0.78f)
+         vu_px(px + (int)(s * (VU_R - 7) + (s < 0 ? -0.5f : 0.5f)),
+               py - (int)(c * (VU_R - 7) + 0.5f), c_inner);
+   }
+
+   /* numero para o qual o ponteiro aponta (fica preto) */
+   for (i = 0; i < 9; i++)
+   {
+      float d = pos - vu_t_tab[i];
+      if (d < 0.0f) d = -d;
+      if (d <= VU_HIT_TOL && d < bestd)
+      {
+         bestd = d;
+         hit   = i;
+      }
+   }
+
+   /* marcas e numeros */
+   for (i = 0; i < 9; i++)
+   {
+      unsigned short col = (vu_db_tab[i] >= 0.0f) ? c_red : c_cyan;
+      float t = vu_t_tab[i];
+      a   = -VU_ANG + t * 2.0f * VU_ANG;
+      rad = a * VU_PI / 180.0f;
+      s = sinf(rad);
+      c = cosf(rad);
+      draw_line(framebuffer, col,
+                px + (int)(s * (VU_R + 1) + (s < 0 ? -0.5f : 0.5f)), py - (int)(c * (VU_R + 1) + 0.5f),
+                px + (int)(s * (VU_R + 4) + (s < 0 ? -0.5f : 0.5f)), py - (int)(c * (VU_R + 4) + 0.5f));
+      vu_text(vu_lbl[i],
+              px + (int)(s * (VU_R + 11) + (s < 0 ? -0.5f : 0.5f)),
+              py - (int)(c * (VU_R + 11) + 0.5f) - 2,
+              i == hit ? get_color(0, 0, 0) : col);
+      if (i < 8)
+      {
+         float tm = (t + vu_t_tab[i + 1]) * 0.5f;
+         a   = -VU_ANG + tm * 2.0f * VU_ANG;
+         rad = a * VU_PI / 180.0f;
+         s = sinf(rad);
+         c = cosf(rad);
+         draw_line(framebuffer, c_inner,
+                   px + (int)(s * (VU_R + 1) + (s < 0 ? -0.5f : 0.5f)), py - (int)(c * (VU_R + 1) + 0.5f),
+                   px + (int)(s * (VU_R + 3) + (s < 0 ? -0.5f : 0.5f)), py - (int)(c * (VU_R + 3) + 0.5f));
+      }
+   }
+
+   vu_text("VU", px, py - 24, c_green);
+   vu_text(ch ? "R" : "L", ch ? x0 + VU_BOX_W - 8 : x0 + 7, y0 + VU_BOX_H - 19, c_cyan);
+
+   /* ponteiro */
+   a   = -VU_ANG + pos * 2.0f * VU_ANG;
+   rad = a * VU_PI / 180.0f;
+   s = sinf(rad);
+   c = cosf(rad);
+   for (i = 0; i < 2; i++)
+      draw_line(framebuffer, c_needle,
+                px + i, py,
+                px + i + (int)(s * (VU_R - 3) + (s < 0 ? -0.5f : 0.5f)), py - (int)(c * (VU_R - 3) + 0.5f));
+   /* cubo do ponteiro: meia-lua magenta centralizada no pivo */
+   {
+      unsigned short c_hub = ch ? get_color(17, 10, 28) : get_color(6, 26, 30); /* R: roxo, L: azul */
+      int dy, hx, half;
+      for (dy = 0; dy < 6; dy++)
+      {
+         half = (int)sqrtf(30.25f - (float)(dy * dy));
+         for (hx = px - half + 1; hx <= px + half; hx++)
+            vu_px(hx, py + 2 - dy, c_hub);
+      }
+   }
+}
+
+static void draw_vu(const short *audio, int frames)
+{
+   int i, ch;
+
+   for (ch = 0; ch < 2; ch++)
+   {
+      double sum = 0.0;
+      float ms, db, target;
+      for (i = 0; i < frames; i++)
+      {
+         float v = (float)audio[i * 2 + ch] * (1.0f / 32768.0f);
+         sum += (double)(v * v);
+      }
+      ms     = (float)(sum / (double)(frames > 0 ? frames : 1));
+      db     = 10.0f * log10f(ms + 1e-10f) + VU_REF_DB;
+      target = vu_db_to_pos(db);
+
+      /* balistica: sobe rapido, desce mais devagar */
+      if (target > vu_pos[ch])
+         vu_pos[ch] += (target - vu_pos[ch]) * 0.35f;
+      else
+         vu_pos[ch] += (target - vu_pos[ch]) * 0.10f;
+      if (vu_pos[ch] < 0.0f) vu_pos[ch] = 0.0f;
+      if (vu_pos[ch] > 1.0f) vu_pos[ch] = 1.0f;
+   }
+
+   draw_vu_one(VU_L_CX, 0, vu_pos[0]);
+   draw_vu_one(VU_R_CX, 1, vu_pos[1]);
+}
 
 /* ---- navegador: janela com o conteudo do .zip atual ----
  * Largura reduzida em 30% e centralizada na tela (horizontal e vertical). */
@@ -1578,6 +1911,442 @@ static void draw_credits(void)
    }
 }
 
+/* ---- sprites que cruzam o player: naves (Xevious, Galaga, extra) e o Arthur correndo ----
+ * Desenhados logo depois do fundo e ANTES da interface, entao ficam por cima so do background e
+ * por baixo de todo o resto. So avancam enquanto uma musica esta tocando (pausa/stop congelam o
+ * relogio) e nao com a janela de creditos aberta. Todos usam a mesma transparencia.
+ * Ciclo de XEV_SHIP_CYCLE frames (20 s):
+ *  - no inicio, uma nave (Xevious, Galaga, extra, Xevious, ...) numa coluna x ALEATORIA, cruzando a
+ *    tela de uma ponta a outra: Xevious e Galaga sobem (de baixo pra cima), a extra desce;
+ *  - antes de tudo, os primeiros XEV_START_DELAY (10 s) de musica nao mostram nada;
+ *  - depois (XEV_RUN_START), um corredor (Arthur, Mario, Sonic ou o carro) corre de uma ponta a outra da tela, vindo da esquerda ou da
+ *    direita (sorteado), com os pes na linha do horizonte do fundo. Roda o GIF COMPLETO (42 quadros:
+ *    sem armadura, prata, verde e dourada), em laco, enquanto atravessa a tela.
+ * As velocidades sao numeros INTEIROS de px por frame: o passo e sempre igual, movimento liso. */
+#define XEV_SHIP_CYCLE      (20 * 60)    /* uma nave + uma corrida a cada 20 s */
+#define XEV_SHIP_SPEED      1            /* px por frame (60 px/s a 60 fps); use 2 pra ficar mais rapida */
+#define XEV_SHIP_TRANSP     75           /* transparencia em % (75 = 25% opaca; era 60, +15%) */
+#define XEV_SHIP_ALPHA      ((255 * (100 - XEV_SHIP_TRANSP)) / 100)
+
+#define XEV_RUN_START       (7 * 60)     /* frame do ciclo em que o Arthur comeca a correr */
+#define XEV_RUN_SPEED       1            /* px por frame (60 px/s a 60 fps; 2 = bem mais rapido) */
+#define XEV_RUN_LINE_Y      286          /* y da linha do horizonte do fundo (640x480): os pes pousam nela */
+#define XEV_RUN_SCALE_PCT   150          /* base de tamanho em % usada por Mario e Sonic (a altura deles parte da do Arthur) */
+#define XEV_START_DELAY     (10 * 60)    /* nenhuma animacao (nave ou corredor) aparece antes de 10 s de musica tocando */
+#define XEV_ARTHUR_SCALE_PCT 175         /* tamanho do Arthur em % (era 150; 100 = original, 200 = dobro) */
+#define XEV_RUN_SMALL_PCT   85           /* Mario e Sonic: % da altura do Arthur (100 = igual, 85 = um pouco menores) */
+#define XEV_RUN_SPEED_SONIC 4            /* px por frame do Sonic (o Sonic corre mais rapido que os outros) */
+#define XEV_CAR_SCALE_PCT   62           /* tamanho do carro cruzando a tela, em % do sprite original (202x64); era 55, um pouco maior */
+#define XEV_RUN_SPEED_CAR   4            /* velocidade do carro em MEIOS pixels por frame (11 = 5,5 px; 10 = 5 px, 12 = 6 px): ainda bem mais rapido que os corredores */
+#define XEV_DIAG_ODDS       6            /* a nave sai na diagonal em 1 de cada 6 vezes (maior = mais raro) */
+#define XEV_REPEAT_ODDS     6            /* sorteio inteligente: um sprite repete o lado/direcao da ultima vez em 1 de cada 6 */
+#define XEV_MIN_COL_JUMP    160          /* a coluna da nave muda pelo menos isso (px) em relacao a ultima vez dela */
+#define XEV_SIDE_LANE_Y     170          /* y (centro) por onde passam as naves horizontais (marcado em vermelho no print) */
+#define XEV_SIDE_SPEED      2            /* px por frame das naves horizontais */
+#define XEV_FLAME_TICKS     5            /* frames do jogo por frame da animacao do fogo (5 = ~80 ms a 60 fps) */
+#define XEV_RUNNER_COUNT    14           /* corredores: Arthur, Mario, Sonic, Carro + 8 extras (revezam a cada ciclo) */
+
+typedef struct
+{
+   int w, h;
+   int scale;                   /* ampliacao do sprite em % (200 = 2x) */
+   int down;                    /* 0 = sobe (de baixo pra cima), 1 = desce (de cima pra baixo) */
+   int flipv;                   /* 1 = espelha o sprite na vertical */
+   const unsigned short *pix;   /* RGB565, 0 = transparente */
+   int side;                    /* 1 = nave horizontal (virada pra direita): cruza a tela da esquerda pra direita e vice-versa */
+   int frames;                  /* quantos frames empilhados tem o sprite (animacao, ex. fogo da turbina); 0 ou 1 = sem animacao */
+} ship_spr_t;
+
+#define XEV_SHIP_COUNT 8
+static const ship_spr_t ship_sprs[XEV_SHIP_COUNT] = {
+   { XEVIOUS_SHIP_W, XEVIOUS_SHIP_H, 200, 0, 0, xevious_ship_rgb, 0, XEVIOUS_SHIP_FRAMES },   /* 16x17 a 200%, sobe, fogo vermelho animado */
+   { GALAGA_SHIP_W,  GALAGA_SHIP_H,  200, 0, 0, galaga_ship_rgb,  0, GALAGA_SHIP_FRAMES },   /* 15x19 a 200%, sobe, fogo animado nas 2 turbinas */
+   { RAIDEN_SHIP_W,  RAIDEN_SHIP_H,  170, 0, 0, raiden_ship_rgb,  0, RAIDEN_SHIP_FRAMES },   /* 22x27 a 170%, fogo animado nas 2 turbinas */
+   { VIPER_SHIP_W,   VIPER_SHIP_H,   145, 0, 0, viper_ship_rgb,   1, VIPER_SHIP_FRAMES },   /* Vic Viper (Gradius): 32 px a 145% = 46 de largura, com fogo azul animado na traseira */
+   { PULSTAR_SHIP_W, PULSTAR_SHIP_H, 125, 0, 0, pulstar_ship_rgb, 1, PULSTAR_SHIP_FRAMES },   /* Pulstar: 33 px a 125% = 41 de largura, com fogo azul animado */
+   { RTYPE_SHIP_W,   RTYPE_SHIP_H,   125, 0, 0, rtype_ship_rgb,   1, RTYPE_SHIP_FRAMES },   /* R-9 (R-Type): 35 px a 125% = 43 de largura, com fogo azul animado */
+   { CHOPLIFTER_SHIP_W, CHOPLIFTER_SHIP_H, 170, 0, 0, choplifter_ship_rgb, 1, CHOPLIFTER_SHIP_FRAMES },   /* Choplifter: helicoptero 41x16 a 170% = 69 de largura, helices (rotor principal e da cauda) animadas */
+   { RALLYX_CARS_W,  RALLYX_CARS_HEIGHT, 200, 0, 0, rallyx_cars_rgb, 0 }  /* Rally-X: os 2 carros juntos (34x36 a 200% = 68x72, 1 pixel de brilho em cada roda), sobem/descem/diagonal como as naves */
+};
+
+static unsigned int xev_seed = 0;      /* 0 = ainda nao semeado: a 1a chamada sorteia a semente (muda a cada execucao) */
+static unsigned int xev_rand(void)
+{
+   if (xev_seed == 0)
+   {
+      unsigned int s = (unsigned int)time(NULL) ^ ((unsigned int)clock() * 2654435761u) ^ (unsigned int)(size_t)&xev_seed;
+      s ^= s >> 16; s *= 0x7feb352du; s ^= s >> 15; s *= 0x846ca68bu; s ^= s >> 16;   /* embaralha bem os bits */
+      xev_seed = s ? s : 0x9E3779B9u;
+   }
+   xev_seed ^= xev_seed << 13;   /* xorshift32 */
+   xev_seed ^= xev_seed >> 17;
+   xev_seed ^= xev_seed << 5;
+   return xev_seed >> 16;
+}
+
+/* desenha um sprite RGB565 (0 = transparente) com a transparencia XEV_SHIP_ALPHA; recorta nas bordas da tela.
+ * pct = tamanho em % (100 = original, 150 = 1,5x), amostragem por vizinho mais proximo */
+static void xev_draw_sprite_pct(const unsigned short *pix, int w, int h, int pct,
+                                int flipv, int fliph, int x, int y)
+{
+   uint16_t *fb = (uint16_t *)framebuffer->pixel_data;
+   int dw = w * pct / 100, dh = h * pct / 100;
+   int dx, dy;
+
+   for (dy = 0; dy < dh; dy++)
+   {
+      int py = y + dy, sy = dy * 100 / pct;
+      if (py < 0 || py >= 480)
+         continue;
+      if (sy >= h) sy = h - 1;
+      for (dx = 0; dx < dw; dx++)
+      {
+         int px = x + dx, sx = dx * 100 / pct;
+         unsigned short v, c, bg;
+         int ir, ig, ib, br, bgg, bb;
+         uint16_t *dst;
+         if (px < 0 || px >= 640)
+            continue;
+         if (sx >= w) sx = w - 1;
+         v = pix[(fliph ? w - 1 - sx : sx) + (flipv ? h - 1 - sy : sy) * w];
+         if (!v)
+            continue;
+         c  = get_color((v >> 11) & 31, (v >> 5) & 63, v & 31);
+         ir = (c >> 11) & 31; ig = (c >> 5) & 63; ib = c & 31;
+         dst = &fb[px + py * framebuffer->width];
+         bg  = *dst;
+         br = (bg >> 11) & 31; bgg = (bg >> 5) & 63; bb = bg & 31;
+         *dst = get_color((ir * XEV_SHIP_ALPHA + br  * (255 - XEV_SHIP_ALPHA)) / 255,
+                          (ig * XEV_SHIP_ALPHA + bgg * (255 - XEV_SHIP_ALPHA)) / 255,
+                          (ib * XEV_SHIP_ALPHA + bb  * (255 - XEV_SHIP_ALPHA)) / 255);
+      }
+   }
+}
+
+/* desenha um sprite RGB565 girado "deg" graus no sentido horario (0 = aponta pra cima), ampliado a "pct" %,
+ * centrado em (cx, cy), com a mesma transparencia das naves. Amostragem por vizinho mais proximo. */
+static void xev_draw_sprite_rot(const unsigned short *pix, int w, int h, int pct, int deg, int cx, int cy)
+{
+   uint16_t *fb = (uint16_t *)framebuffer->pixel_data;
+   float rad = (float)deg * 3.14159265f / 180.0f;
+   float cs = cosf(rad), sn = sinf(rad);
+   int half = (int)(sqrtf((float)(w * w + h * h)) * (float)pct / 100.0f * 0.5f) + 2;
+   int dx, dy;
+
+   for (dy = -half; dy <= half; dy++)
+   {
+      int py = cy + dy;
+      if (py < 0 || py >= 480)
+         continue;
+      for (dx = -half; dx <= half; dx++)
+      {
+         int px = cx + dx, sx, sy;
+         float fx, fy;
+         unsigned short v, c, bg;
+         int ir, ig, ib, br, bgg, bb;
+         uint16_t *dst;
+         if (px < 0 || px >= 640)
+            continue;
+         /* gira o ponto de destino de volta pro sprite original */
+         fx = ( (float)dx * cs + (float)dy * sn) * 100.0f / (float)pct + (float)w * 0.5f;
+         fy = (-(float)dx * sn + (float)dy * cs) * 100.0f / (float)pct + (float)h * 0.5f;
+         if (fx < 0.0f || fy < 0.0f)
+            continue;
+         sx = (int)fx; sy = (int)fy;
+         if (sx >= w || sy >= h)
+            continue;
+         v = pix[sx + sy * w];
+         if (!v)
+            continue;
+         c  = get_color((v >> 11) & 31, (v >> 5) & 63, v & 31);
+         ir = (c >> 11) & 31; ig = (c >> 5) & 63; ib = c & 31;
+         dst = &fb[px + py * framebuffer->width];
+         bg  = *dst;
+         br = (bg >> 11) & 31; bgg = (bg >> 5) & 63; bb = bg & 31;
+         *dst = get_color((ir * XEV_SHIP_ALPHA + br  * (255 - XEV_SHIP_ALPHA)) / 255,
+                          (ig * XEV_SHIP_ALPHA + bgg * (255 - XEV_SHIP_ALPHA)) / 255,
+                          (ib * XEV_SHIP_ALPHA + bb  * (255 - XEV_SHIP_ALPHA)) / 255);
+      }
+   }
+}
+
+/* direcoes possiveis das naves: vx/vy (-1, 0, 1) e o giro do sprite (0 = aponta pra cima, sentido horario) */
+typedef struct { int vx, vy, deg; } ship_head_t;
+#define XEV_HEAD_COUNT 6
+static const ship_head_t xev_heads[XEV_HEAD_COUNT] = {
+   {  0, -1,   0 },   /* sobe */
+   {  0,  1, 180 },   /* desce */
+   {  1, -1,  45 },   /* diagonal: sobe indo pra direita */
+   {  1,  1, 135 },   /* diagonal: desce indo pra direita */
+   { -1,  1, 225 },   /* diagonal: desce indo pra esquerda */
+   { -1, -1, 315 }    /* diagonal: sobe indo pra esquerda */
+};
+
+/* sorteio "inteligente": embaralha 0..n-1 num saco; o 1o do novo saco nunca e o ultimo do saco anterior */
+static void xev_shuffle(int *bag, int n, int last)
+{
+   int i, j, tmp;
+   for (i = 0; i < n; i++)
+      bag[i] = i;
+   for (i = n - 1; i > 0; i--)
+   {
+      j = (int)(xev_rand() % (unsigned)(i + 1));
+      tmp = bag[i]; bag[i] = bag[j]; bag[j] = tmp;
+   }
+   if (last >= 0 && bag[0] == last)
+   {
+      j = 1 + (int)(xev_rand() % (unsigned)(n - 1));
+      tmp = bag[0]; bag[0] = bag[j]; bag[j] = tmp;
+   }
+}
+
+/* escolhe 0/1 pra um sprite: na 1a vez e aleatorio; depois quase sempre o OPOSTO da ultima vez (repete so ~1 em 6) */
+static int xev_pick_side(int last)
+{
+   if (last < 0)
+      return (int)((xev_rand() >> 3) & 1);
+   return (xev_rand() % XEV_REPEAT_ODDS == 0) ? last : !last;
+}
+
+/* escolhe a direcao da nave: quase sempre VERTICAL (sobe/desce, alternando em relacao a ultima vez);
+ * so raramente (1 em XEV_DIAG_ODDS) vai pra uma das 4 diagonais, tambem evitando repetir a ultima */
+static int xev_pick_head(int last)
+{
+   if (xev_rand() % XEV_DIAG_ODDS == 0)
+   {
+      int r = 2 + (int)(xev_rand() % 4);
+      if (r == last && xev_rand() % XEV_REPEAT_ODDS != 0)
+         r = 2 + (r - 2 + 1 + (int)(xev_rand() % 3)) % 4;
+      return r;
+   }
+   if (last == 0 || last == 1)
+      return (xev_rand() % XEV_REPEAT_ODDS == 0) ? last : 1 - last;
+   return (int)((xev_rand() >> 3) & 1);
+}
+
+/* ---- agendamento: nave e corredor INDEPENDENTES (podem aparecer juntos) ----
+ * Cada um tem o seu proprio ciclo: entra, cruza a tela, sai, sorteia a SUA pausa (gap) e entra de novo. Nenhum espera o outro;
+ * como as pausas e as velocidades sao diferentes, as entradas/saidas nunca ficam sincronizadas.
+ * Nada aparece antes de 10 s de musica. */
+#define XEV_SHIP_GAP_MIN    (4 * 60)     /* pausa depois que a nave sai da tela, ate a PROXIMA NAVE entrar: de 4 a 14 s (sorteada) */
+#define XEV_SHIP_GAP_MAX    (14 * 60)
+#define XEV_RUN_GAP_MIN     (3 * 60)     /* pausa depois que o corredor sai da tela, ate o PROXIMO CORREDOR entrar: de 3 a 11 s (sorteada) */
+#define XEV_RUN_GAP_MAX     (11 * 60)
+
+static void draw_xevious_ship(void)
+{
+   static int clock = 0, started = 0;
+   static int ship_bag[XEV_SHIP_COUNT], ship_pos = XEV_SHIP_COUNT, ship_idx = -1, ship_head = 0, ship_x = 0;
+   static int ship_active = 0, ship_t = 0, ship_seen = 0, ship_next = 0;
+   static int run_bag[XEV_RUNNER_COUNT], run_pos = XEV_RUNNER_COUNT, run_idx = -1, run_right = 1;
+   static int run_active = 0, run_t = 0, run_seen = 0, run_next = 0;
+   static int ship_last_head[XEV_SHIP_COUNT] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+   static int ship_last_x[XEV_SHIP_COUNT]    = { -1, -1, -1, -1, -1, -1, -1, -1 };
+   static int run_last_side[XEV_RUNNER_COUNT] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+   const ship_spr_t *sp;
+   int w, h, x, vis;
+
+   if (!get_is_playing() || credits_open_state)
+      return;                      /* parado/pausado: congela (nem desenha) */
+
+   if (!started)                   /* a cada execucao: nave e corredor tem 1o aparecimento proprio, entre 10 e 22 s de musica */
+   {
+      started   = 1;
+      ship_next = XEV_START_DELAY + (int)(xev_rand() % (unsigned)(12 * 60 + 1));
+      run_next  = XEV_START_DELAY + (int)(xev_rand() % (unsigned)(12 * 60 + 1));
+   }
+   clock++;
+
+   /* nave: hora de sair -> sorteia qual (saco embaralhado), direcao e coluna */
+   if (!ship_active && clock >= ship_next)
+   {
+      int tries;
+
+      if (ship_pos >= XEV_SHIP_COUNT)
+      {
+         xev_shuffle(ship_bag, XEV_SHIP_COUNT, ship_idx);
+         ship_pos = 0;
+      }
+      ship_idx  = ship_bag[ship_pos++];
+      sp        = &ship_sprs[ship_idx];
+      w         = sp->w * sp->scale / 100;
+      if (sp->side)
+         ship_head = xev_pick_side(ship_last_head[ship_idx]);   /* 1 = esquerda -> direita, 0 = direita -> esquerda; raramente repete */
+      else
+      {
+         ship_head = xev_pick_head(ship_last_head[ship_idx]);   /* sobe/desce; diagonal so raramente */
+         for (tries = 0; tries < 8; tries++)                    /* coluna: longe da ultima desta nave */
+         {
+            ship_x = (int)(xev_rand() % (unsigned)(640 - w + 1));
+            if (ship_last_x[ship_idx] < 0 || xev_rand() % XEV_REPEAT_ODDS == 0 ||
+                abs(ship_x - ship_last_x[ship_idx]) >= XEV_MIN_COL_JUMP)
+               break;
+         }
+         ship_last_x[ship_idx] = ship_x;
+      }
+      ship_last_head[ship_idx] = ship_head;
+      ship_active = 1;
+      ship_t      = 0;
+      ship_seen   = 0;
+   }
+
+   /* corredor: hora de sair -> sorteia quem (saco embaralhado) e o lado oposto ao da ultima vez dele */
+   if (!run_active && clock >= run_next)
+   {
+      if (run_pos >= XEV_RUNNER_COUNT)
+      {
+         xev_shuffle(run_bag, XEV_RUNNER_COUNT, run_idx);
+         run_pos = 0;
+      }
+      run_idx   = run_bag[run_pos++];
+      run_right = xev_pick_side(run_last_side[run_idx]);            /* 1 = vem da esquerda, 0 = da direita */
+      run_last_side[run_idx] = run_right;
+      run_active = 1;
+      run_t      = 0;
+      run_seen   = 0;
+   }
+
+   /* nave horizontal (Vic Viper, Pulstar, R-9): cruza a tela na altura XEV_SIDE_LANE_Y, da esquerda pra direita ou vice-versa;
+      nave vertical: cruza a tela subindo, descendo ou na diagonal (o sprite gira pra apontar pra onde vai) */
+   if (ship_active)
+   {
+      vis = 0;
+      sp  = &ship_sprs[ship_idx];
+      w   = sp->w * sp->scale / 100;
+      h   = sp->h * sp->scale / 100;
+      if (sp->side)
+      {
+         x = ship_head ? -w + ship_t * XEV_SIDE_SPEED : 640 - ship_t * XEV_SIDE_SPEED;
+         if (x < 640 && x + w > 0)
+         {
+            xev_draw_sprite_pct(sp->pix + ((sp->frames > 1) ? ((ship_t / XEV_FLAME_TICKS) % sp->frames) * sp->w * sp->h : 0),
+                                sp->w, sp->h, sp->scale, 0, !ship_head, x, XEV_SIDE_LANE_Y - h / 2);
+            vis = 1;
+         }
+      }
+      else
+      {
+         const ship_head_t *hd = &xev_heads[ship_head];
+         int hw, cx0, cy0, cx, cy;
+
+         hw = (int)(sqrtf((float)(w * w + h * h)) * 0.5f) + 2;      /* raio do sprite girado */
+
+         if (hd->vx == 0)
+            cx0 = ship_x + w / 2;                                    /* coluna sorteada */
+         else if (hd->vx > 0)
+            cx0 = ship_x * 3 / 5 - hw;                               /* comeca fora da tela, a esquerda */
+         else
+            cx0 = 640 + hw - ship_x * 3 / 5;                         /* comeca fora da tela, a direita */
+         cy0 = (hd->vy > 0) ? -hw : 480 + hw;
+
+         cx = cx0 + hd->vx * ship_t * XEV_SHIP_SPEED;
+         cy = cy0 + hd->vy * ship_t * XEV_SHIP_SPEED;
+         if (cx > -hw && cx < 640 + hw && cy > -hw && cy < 480 + hw)
+         {
+            xev_draw_sprite_rot(sp->pix + ((sp->frames > 1) ? ((ship_t / XEV_FLAME_TICKS) % sp->frames) * sp->w * sp->h : 0),
+                                sp->w, sp->h, sp->scale, hd->deg, cx, cy);
+            vis = 1;
+         }
+      }
+      if (vis)
+         ship_seen = 1;
+      ship_t++;
+      if ((ship_seen && !vis) || ship_t > 1500)       /* saiu da tela: sorteia a pausa ate a PROXIMA NAVE (independe do corredor) */
+      {
+         ship_active = 0;
+         ship_next   = clock + XEV_SHIP_GAP_MIN + (int)(xev_rand() % (unsigned)(XEV_SHIP_GAP_MAX - XEV_SHIP_GAP_MIN + 1));
+      }
+   }
+
+   /* corredor (Arthur, Mario, Sonic, o carro e os extras) na linha do horizonte, vindo da esquerda ou da direita */
+   if (run_active)
+   {
+      int tr = run_t;
+      int who = run_idx;                                  /* corredor sorteado desta vez */
+      int rw, rh, rfeet, rms, rframes, pct, f, aw, af, spd;
+      const unsigned short *pix;
+
+      switch (who)
+      {
+         case 1:  rw = MARIO_RUN_W;  rh = MARIO_RUN_H;  rfeet = MARIO_RUN_FEET;  rms = MARIO_RUN_MS;
+                  rframes = MARIO_RUN_FRAMES;  break;
+         case 2:  rw = SONIC_RUN_W;  rh = SONIC_RUN_H;  rfeet = SONIC_RUN_FEET;  rms = SONIC_RUN_MS;
+                  rframes = SONIC_RUN_FRAMES;  break;
+         case 3:  rw = CAR_RUN_W;   rh = CAR_RUN_H;   rfeet = CAR_RUN_FEET;   rms = CAR_RUN_MS;
+                  rframes = CAR_RUN_FRAMES;  break;
+         case 4:  rw = MARIO16_RUN_W;  rh = MARIO16_RUN_H;  rfeet = MARIO16_RUN_FEET;  rms = MARIO16_RUN_MS;
+                  rframes = MARIO16_RUN_FRAMES;  break;
+         case 5:  rw = FATGUY_RUN_W;  rh = FATGUY_RUN_H;  rfeet = FATGUY_RUN_FEET;  rms = FATGUY_RUN_MS;
+                  rframes = FATGUY_RUN_FRAMES;  break;
+         case 6:  rw = MEGAMAN_RUN_W;  rh = MEGAMAN_RUN_H;  rfeet = MEGAMAN_RUN_FEET;  rms = MEGAMAN_RUN_MS;
+                  rframes = MEGAMAN_RUN_FRAMES;  break;
+         case 7:  rw = MICKEY_RUN_W;  rh = MICKEY_RUN_H;  rfeet = MICKEY_RUN_FEET;  rms = MICKEY_RUN_MS;
+                  rframes = MICKEY_RUN_FRAMES;  break;
+         case 8:  rw = PACMAN_RUN_W;  rh = PACMAN_RUN_H;  rfeet = PACMAN_RUN_FEET;  rms = PACMAN_RUN_MS;
+                  rframes = PACMAN_RUN_FRAMES;  break;
+         case 9:  rw = RYU_RUN_W;  rh = RYU_RUN_H;  rfeet = RYU_RUN_FEET;  rms = RYU_RUN_MS;
+                  rframes = RYU_RUN_FRAMES;  break;
+         case 10:  rw = KEN_RUN_W;  rh = KEN_RUN_H;  rfeet = KEN_RUN_FEET;  rms = KEN_RUN_MS;
+                  rframes = KEN_RUN_FRAMES;  break;
+         case 11:  rw = RAYMAN_RUN_W;  rh = RAYMAN_RUN_H;  rfeet = RAYMAN_RUN_FEET;  rms = RAYMAN_RUN_MS;
+                  rframes = RAYMAN_RUN_FRAMES;  break;
+         case 12:  rw = SHINOBI_RUN_W;  rh = SHINOBI_RUN_H;  rfeet = SHINOBI_RUN_FEET;  rms = SHINOBI_RUN_MS;
+                  rframes = SHINOBI_RUN_FRAMES;  break;
+         case 13:  rw = ALEX_RUN_W;  rh = ALEX_RUN_H;  rfeet = ALEX_RUN_FEET;  rms = ALEX_RUN_MS;
+                  rframes = ALEX_RUN_FRAMES;  break;
+         default: rw = ARTHUR_RUN_W; rh = ARTHUR_RUN_H; rfeet = ARTHUR_RUN_FEET; rms = ARTHUR_RUN_MS;
+                  rframes = ARTHUR_RUN_FRAMES; break;
+      }
+      f = (tr * 1000 / 60 / rms) % rframes;                     /* usa a duracao de cada GIF */
+      switch (who)
+      {
+         case 1:  pix = mario_run_rgb[f];  break;
+         case 2:  pix = sonic_run_rgb[f];  break;
+         case 3:  pix = car_run_rgb[f];    break;
+         case 4:  pix = mario16_run_rgb[f];  break;
+         case 5:  pix = fatguy_run_rgb[f];  break;
+         case 6:  pix = megaman_run_rgb[f];  break;
+         case 7:  pix = mickey_run_rgb[f];  break;
+         case 8:  pix = pacman_run_rgb[f];  break;
+         case 9:  pix = ryu_run_rgb[f];  break;
+         case 10:  pix = ken_run_rgb[f];  break;
+         case 11:  pix = rayman_run_rgb[f];  break;
+         case 12:  pix = shinobi_run_rgb[f];  break;
+         case 13:  pix = alex_run_rgb[f];  break;
+         default: pix = arthur_run_rgb[f]; break;
+      }
+      if (who == 0)
+         pct = XEV_ARTHUR_SCALE_PCT * ARTHUR_RUN_H / rh;        /* Arthur */
+      else if (who == 3)
+         pct = XEV_CAR_SCALE_PCT;                                /* Carro: escala propria, nao relativa ao Arthur */
+      else
+         pct = XEV_RUN_SCALE_PCT * ARTHUR_RUN_H / rh * XEV_RUN_SMALL_PCT / 100;   /* Mario e Sonic: mesmo tamanho de antes */
+      if (who >= 4 && who <= 11)
+         pct = pct * runners_extra_scale[who - 4] / 100;
+      if (who == 13)
+         pct = pct * ALEX_RUN_SCALE / 100;                   /* Alex: tamanho proprio */
+      if (who == 12)
+         pct = pct * SHINOBI_RUN_SCALE / 100;                /* Shinobi: tamanho proprio */       /* ajuste de tamanho de cada corredor extra */
+      spd = (who == 13) ? ALEX_RUN_SPEED : (who == 12) ? SHINOBI_RUN_SPEED : (who >= 4) ? runners_extra_speed[who - 4] : (who == 3) ? XEV_RUN_SPEED_CAR : 2 * ((who == 2) ? XEV_RUN_SPEED_SONIC : XEV_RUN_SPEED);   /* em meios pixels por frame */   /* Sonic/carro tem velocidade propria */
+      aw  = rw * pct / 100;                                     /* largura ja ampliada */
+      af  = (rfeet * pct + 50) / 100;                           /* altura dos pes ja ampliada */
+      x = run_right ? -aw + tr * spd / 2 : 640 - tr * spd / 2;
+      vis = (x < 640 && x + aw > 0);
+      if (vis)
+      {
+         xev_draw_sprite_pct(pix, rw, rh, pct, 0, !run_right,
+                             x, XEV_RUN_LINE_Y - af);   /* a sola do pe fica na linha */
+         run_seen = 1;
+      }
+      run_t++;
+      if ((run_seen && !vis) || run_t > 3000)         /* saiu da tela: sorteia a pausa ate o PROXIMO CORREDOR (independe da nave) */
+      {
+         run_active = 0;
+         run_next   = clock + XEV_RUN_GAP_MIN + (int)(xev_rand() % (unsigned)(XEV_RUN_GAP_MAX - XEV_RUN_GAP_MIN + 1));
+      }
+   }
+}
+
 void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
@@ -2108,9 +2877,11 @@ void retro_run(void)
 
    //graphic handling
    spectrum_draw_background(framebuffer);
+   draw_xevious_ship();   /* acima so do fundo, abaixo de todo o resto */
    draw_ui();
    draw_waveform(audio, 735);
    spectrum_draw_bars(framebuffer);
+   draw_vu(audio, 735);
    if(browser_open_state)
       draw_browser();
    if(credits_open_state)
