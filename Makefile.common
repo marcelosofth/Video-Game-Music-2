@@ -153,6 +153,7 @@ FLUIDSYNTH_BUILD := $(FLUIDSYNTH_DIR)/build
 INCFLAGS += -I$(FLUIDSYNTH_DIR)/include -I$(FLUIDSYNTH_BUILD)/include
 CXXFLAGS += -DGME2_WITH_FLUIDSYNTH
 LDFLAGS  += $(shell find $(FLUIDSYNTH_BUILD)/src -maxdepth 1 -name 'libfluidsynth*.a')
+LDFLAGS  += -lwinmm
 
 # ---- dr_mp3 (decodificador MP3, dominio publico) ----
 INCFLAGS += -I$(DEPS_DIR)/dr_libs
