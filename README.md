@@ -1,2 +1,2 @@
-# libretro-gme
-Port of blargg's Game_Music_Emu library
+# libretro-gme2
+Port of blargg's Game_Music_Emu 2 library
