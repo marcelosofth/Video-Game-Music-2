@@ -1,0 +1,42 @@
+BATOCERA:
+
+Downloads:
+https://drive.google.com/drive/folders/16vK_Pg70DoVhu_42E7QxhBS1v35Fon5U?usp=sharing
+
+Apertar F1 para acessar o explorador de arquivos
+do Batocera, ir em /userdata/roms e criar a pasta
+"gme2", depois copiar todo o conteúdo da pasta
+Músicas para dentro do "gme2".
+
+Copiar o arquivo: es_systems_gme2.cfg 
+para /userdata/system/configs/emulationstation
+---------------------------------------------------
+Em: /userdata/system abrir o arquivo: batocera.conf
+e copiar essas 2 linhas no final do arquivo:
+gme2.emulator=libretro
+gme2.core=gme2
+---------------------------------------------------
+Copiar o arquivo gme2_libretro.info dentro da pasta
+/usr/share/libretro/info
+---------------------------------------------------
+Copiar o arquivo: gme2_libretro.so dentro da pasta
+/usr/lib/libretro e por fim no Explorador de
+arquivos apertar F4 para o CMD e digitar:
+chmod 755 /usr/lib/libretro/tk2000_libretro.so
+batocera-save-overlay
+Reiniciar!
+
+===================================================
+
+RETROARCH / WINDOWS:
+
+Copiar o arquivo: gme2_libretro.dll para dentro
+da pasta: \RetroArch\cores
+
+Copiar o arquivo: gme2_libretro.info para dentro
+da pasta: \RetroArch\info
+
+Apagar este arquivo para atualizar a lista de cores!
+RetroArch\info\core_info.cache
+
+Fechar e abrir novamente o Retroarch!

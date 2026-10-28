@@ -1,0 +1,6 @@
+Apagar o arquivo de notificação de mapeamento:
+/userdata/system/configs/retroarch/config/remaps/common
+Arquivo: common.rmp
+
+Abrir o GME e apertar F1 e depois Backspace e fazer
+os ajustes de Video e Mapeamento dos botões!
